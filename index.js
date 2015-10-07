@@ -681,7 +681,7 @@ kue.createQueue = function(options) {
     queue._cli = redis.createClient();
 
     //auto enable key expiry notifications
-    queue.enableExpiryNotifications();
+    //queue.enableExpiryNotifications();
 
     //listen for job key expiry
     //and schedule kue jobs to run
