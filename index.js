@@ -10,7 +10,7 @@
 
 
 //dependencies
-var kue = require('kue');
+var kue = require('kue-unique');
 var Job = kue.Job;
 var Queue = kue;
 //
@@ -34,6 +34,7 @@ var CronTime = require('cron').CronTime;
  */
 Queue.prototype._getJobExpiryKey = function(uuid) {
     //this refer to kue Queue instance context
+
     return this.options.prefix + ':scheduler:' + uuid;
 };
 
@@ -46,10 +47,75 @@ Queue.prototype._getJobExpiryKey = function(uuid) {
  * @private
  */
 Queue.prototype._isJobExpiryKey = function(jobExpiryKey) {
-    //test if key provide is valid job expiry key 
+    //this refer to kue Queue instance context
+
     var isJobExpiryKey = this._jobExpiryKeyValidator.test(jobExpiryKey);
 
     return isJobExpiryKey;
+};
+
+
+/**
+ * @description check if job exists and its ttl has not timeout
+ * @param  {String}   jobExpiryKey valid job expiry key
+ * @param  {Function} done         a function to invoke on success or error
+ * @return {Boolean}               whether job already scheduled or not
+ * @private
+ */
+Queue.prototype._isJobAlreadyScheduled = function(jobExpiryKey, done) {
+    //this refer to kue Queue instance context
+
+    async.parallel({
+
+        exists: function isKeyExists(next) {
+            this._scheduler.exists(jobExpiryKey, next);
+        }.bind(this),
+
+        ttl: function isKeyExpired(next) {
+            this._scheduler.pttl(jobExpiryKey, next);
+        }.bind(this)
+
+    }, function(error, results) {
+        if (error) {
+            done(error);
+        } else {
+            var exists = (results.exists && results.exists === 1) ? true : false;
+            var active = (results.ttl && results.ttl > 0) ? true : false;
+
+            var alreadyScheduled = exists && active;
+            done(null, alreadyScheduled);
+        }
+    });
+};
+
+
+/**
+ * @description generate job uuid from job definition
+ * @param  {Object} jobDefinition valid job definition
+ * @return {String}               job uuid
+ * @private
+ */
+Queue.prototype._generateJobUUID = function(jobDefinition) {
+    //this refer to kue Queue instance context
+    
+    var unique = jobDefinition.data ? jobDefinition.data.unique : undefined;
+    var type = jobDefinition.type ? jobDefinition.type : undefined;
+
+    //deduce job uuid from unique key
+    if (unique) {
+        return _.snakeCase(unique);
+    }
+
+    //deduce uuid from job type
+    else if (type) {
+        return _.snakeCase(type);
+    }
+
+    //otherwise generate uuid
+    else {
+        return uuid.v1();
+    }
+
 };
 
 
@@ -61,6 +127,7 @@ Queue.prototype._isJobExpiryKey = function(jobExpiryKey) {
  */
 Queue.prototype._getJobUUID = function(jobExpiryKey) {
     //this refer to kue Queue instance context
+
     return jobExpiryKey.split(':')[2];
 };
 
@@ -73,6 +140,7 @@ Queue.prototype._getJobUUID = function(jobExpiryKey) {
  */
 Queue.prototype._getJobDataKey = function(uuid) {
     //this refer to kue Queue instance context
+
     return this.options.prefix + ':scheduler:data:' + uuid;
 };
 
@@ -87,12 +155,9 @@ Queue.prototype._saveJobData = function(jobDataKey, jobData, done) {
 
     this
         ._scheduler
-        .set(
-            jobDataKey,
-            JSON.stringify(jobData),
-            function(error /*, response*/ ) {
-                done(error, jobData);
-            });
+        .set(jobDataKey, JSON.stringify(jobData), function(error /*, response*/ ) {
+            done(error, jobData);
+        });
 };
 
 
@@ -120,10 +185,7 @@ Queue.prototype._readJobData = function(jobDataKey, done) {
 Queue.prototype.enableExpiryNotifications = function() {
     //this refer to Queue instance context
 
-    //enable 
-    //Keyevent events, published with __keyevent@<db>__ prefix
-    //
-    //Expired events (events generated every time a key expires)
+    //enable expired events (events generated every time a key expires)
     this._cli.config('SET', 'notify-keyspace-events', 'Ex');
 };
 
@@ -132,7 +194,6 @@ Queue.prototype.enableExpiryNotifications = function() {
  * @function
  * @description parse date.js valid string and return a date object
  * @param  {String}   str  a valid date.js date string
- * @param  {Date}   offset  a valid date which will be used as offset in datejs
  * @param  {Function} done a callback to invoke on error or success
  * @private
  */
@@ -157,11 +218,8 @@ Queue.prototype._parse = function(str, done) {
  */
 Queue.prototype._buildJob = function(jobDefinition, done) {
     //this refer to kue Queue instance context
-    var self = this;
 
-
-    async
-    .parallel({
+    async.parallel({
             isDefined: function(next) {
                 //is job definition provided
                 var isObject = _.isPlainObject(jobDefinition);
@@ -210,10 +268,7 @@ Queue.prototype._buildJob = function(jobDefinition, done) {
 
                 //instantiate kue job
                 var job =
-                    self.createJob(
-                        jobDefinition.type,
-                        jobDefinition.data
-                    );
+                    this.createJob(jobDefinition.type, jobDefinition.data);
 
                 //apply all job attributes into kue job instance
                 _.keys(jobDefinition).forEach(function(attribute) {
@@ -246,7 +301,7 @@ Queue.prototype._buildJob = function(jobDefinition, done) {
                 //we are done
                 done(null, job, validations);
             }
-        });
+        }.bind(this));
 };
 
 
@@ -258,6 +313,7 @@ Queue.prototype._buildJob = function(jobDefinition, done) {
  */
 Queue.prototype._computeNextRunTime = function(jobData, done) {
     //this refer to kue Queue instance context
+
     if (!jobData) {
         return done(new Error('Invalid job data'));
     }
@@ -266,8 +322,7 @@ Queue.prototype._computeNextRunTime = function(jobData, done) {
     var interval = jobData.reccurInterval;
 
 
-    async
-    .parallel({
+    async.parallel({
         //compute next run from cron interval
         cron: function(after) {
             try {
@@ -334,13 +389,92 @@ Queue.prototype._computeNextRunTime = function(jobData, done) {
 
 
 /**
+ * @description respond to job key expiry events
+ * @param  {String} jobExpiryKey valid job expiry key
+ */
+Queue.prototype._onJobKeyExpiry = function(jobExpiryKey) {
+    //this refer to kue Queue instance context
+
+    async.waterfall(
+        [
+            //get job data
+            function getJobData(next) {
+                //get job uuid
+                var jobUUID = this._getJobUUID(jobExpiryKey);
+
+                //get saved job data
+                this._readJobData(this._getJobDataKey(jobUUID), next);
+            }.bind(this),
+
+            //compute next run time
+            function computeNextRun(jobData, next) {
+                this
+                    ._computeNextRunTime(jobData, function(error, nextRunTime) {
+                        if (error) {
+                            next(error);
+                        } else {
+                            next(null, jobData, nextRunTime);
+                        }
+                    });
+            }.bind(this),
+
+            //resave the key to rerun this job again
+            function resaveJobKey(jobData, nextRunTime, next) {
+
+                //compute delay
+                var now = new Date();
+                var delay = nextRunTime.getTime() - now.getTime();
+
+                this
+                    ._scheduler
+                    .set(jobExpiryKey, '', 'PX', delay, function(error) {
+                        if (error) {
+                            next(error);
+                        } else {
+                            next(null, jobData);
+                        }
+                    });
+            }.bind(this),
+
+            function buildJob(jobDefinition, next) {
+                this._buildJob(jobDefinition, next);
+            }.bind(this),
+
+            function runJob(job, validations, next) {
+                job.save(function(error, existJob) {
+                    if (error) {
+                        next(error);
+                    } else {
+                        //ensure unique job
+                        if (existJob && existJob.alreadyExist) {
+                            //inactivate to signal next run
+                            existJob.inactive();
+                        }
+
+                        next(null, existJob || job);
+                    }
+                });
+            }
+        ],
+        function(error, job) {
+            if (error) {
+                this.emit('schedule error', error);
+            } else if (job.alreadyExist) {
+                this.emit('already scheduled', job);
+            } else {
+                this.emit('schedule success', job);
+            }
+        }.bind(this));
+};
+
+
+/**
  * @function
  * @description subscribe to key expiry events
  * @private
  */
 Queue.prototype._subscribe = function() {
     //this refer to kue Queue instance context
-    var self = this;
 
     //listen for job key expiry
     this
@@ -349,66 +483,17 @@ Queue.prototype._subscribe = function() {
 
             //test if the event key is job expiry key 
             //and emit `scheduler unknown job expiry key` if not
-            if (!self._isJobExpiryKey(jobExpiryKey)) {
-                self.emit('scheduler unknown job expiry key', jobExpiryKey);
+            if (!this._isJobExpiryKey(jobExpiryKey)) {
+                this.emit('scheduler unknown job expiry key', jobExpiryKey);
                 return;
             }
 
-            async
-            .waterfall(
-                [
-                    //get job data
-                    function getJobData(next) {
-                        //get job uuid
-                        var jobUUID = self._getJobUUID(jobExpiryKey);
+            this._onJobKeyExpiry(jobExpiryKey);
 
-                        //get saved job data
-                        self._readJobData(self._getJobDataKey(jobUUID), next);
-                    },
-                    //compute next run time
-                    function computeNextRun(jobData, next) {
-                        self
-                            ._computeNextRunTime(jobData, function(error, nextRunTime) {
-                                if (error) {
-                                    next(error);
-                                } else {
-                                    next(null, jobData, nextRunTime);
-                                }
-                            });
-                    },
-                    //resave the key to rerun this job again
-                    function resaveJobKey(jobData, nextRunTime, next) {
-
-                        //compute delay
-                        var now = new Date();
-                        var delay = nextRunTime.getTime() - now.getTime();
-
-                        self
-                            ._scheduler
-                            .set(jobExpiryKey, '', 'PX', delay, function(error) {
-                                if (error) {
-                                    next(error);
-                                } else {
-                                    next(null, jobData);
-                                }
-                            });
-                    },
-                    function buildJob(jobDefinition, next) {
-                        self._buildJob(jobDefinition, next);
-                    }
-                ],
-                function(error, job) {
-                    if (error) {
-                        self.emit('schedule error', error);
-                    } else {
-                        //run job immediately
-                        self.now(job);
-                    }
-                });
-        });
+        }.bind(this));
 
     //subscribe to key expiration events
-    self._listener.subscribe('__keyevent@0__:expired');
+    this._listener.subscribe('__keyevent@0__:expired');
 
 };
 
@@ -419,6 +504,7 @@ Queue.prototype._subscribe = function() {
  *
  *              If an error occur, it will be emitted using `schedule error` key
  *              with error passed as first parameter on event.
+ *              
  *              If job schedule successfully, it will be emitted using
  *              `schedule success` key with job instance passed as a first parameter
  *              on event.
@@ -426,65 +512,115 @@ Queue.prototype._subscribe = function() {
  * @param  {String} interval      scheduled interval in either human interval or
  *                                cron format
  * @param  {Job} job valid kue job instance which has not been saved
+ * @example
+ *     1. create non-unique job
+ *     var job = Queue
+ *            .createJob('every', data)
+ *            .attempts(3)
+ *            .priority('normal');
+ *            
+ *      Queue.every('2 seconds', job);
+ *
+ *      2. create unique job
+ *      var job = Queue
+ *              .create('every', data)
+ *              .attempts(3)
+ *              .priority('normal')
+ *              .unique(<unique_key>);
+ *              
+ *      Queue.every('2 seconds', job);
  * @private
  */
 Queue.prototype.every = function(interval, job) {
     //this refer to kue Queue instance context
-    var self = this;
 
-    if (arguments.length !== 2) {
-        self.emit(
+    //back-off if no interval and job
+    if (!interval || !job) {
+        this.emit(
             'schedule error',
-            new Error('Invalid number of parameters. See API doc.')
+            new Error('Invalid number of parameters')
         );
     }
 
-    //extend job definition with
-    //scheduling data
-    var jobDefinition = _.merge(job.toJSON(), {
-        reccurInterval: interval,
-        data: {
-            schedule: 'RECCUR'
-        },
-        backoff: job._backoff
-    });
+    //check for job instance
+    else if (!(job instanceof Job)) {
+        this.emit(
+            'schedule error',
+            new Error('Invalid job type')
+        );
+    }
 
-    //generate job uuid
-    var jobUUID = uuid.v1();
+    //continue with processing job
+    else {
 
-    async
-    .parallel({
-        jobExpiryKey: function(next) {
-            next(null, self._getJobExpiryKey(jobUUID));
-        },
-        jobDataKey: function(next) {
-            next(null, self._getJobDataKey(jobUUID));
-        },
-        nextRunTime: function(next) {
-            self._computeNextRunTime(jobDefinition, next);
-        }
-    }, function finish(error, results) {
-
-        var now = new Date();
-        var delay = results.nextRunTime.getTime() - now.getTime();
-
-        async
-        .waterfall([
-            function saveJobData(next) {
-                //save job data
-                self._saveJobData(results.jobDataKey, jobDefinition, next);
+        //extend job definition with
+        //scheduling data
+        var jobDefinition = _.merge(job.toJSON(), {
+            reccurInterval: interval,
+            data: {
+                schedule: 'RECCUR'
             },
-            function setJobKeyExpiry(jobData, next) {
-                //save key an wait for it to expiry
-                self._scheduler.set(results.jobExpiryKey, '', 'PX', delay, next);
-            }
-        ], function(error) {
-            if (error) {
-                self.emit('schedule error', error);
-            }
+            backoff: job._backoff
         });
 
-    });
+        //generate job uuid
+        var jobUUID = this._generateJobUUID(jobDefinition);
+
+        //check if job already scheduled
+        this._isJobAlreadyScheduled(this._getJobExpiryKey(jobUUID), function(error, isAlreadyScheduled) {
+            if (error) {
+                this.emit('schedule error', error);
+            }
+
+            if (!isAlreadyScheduled) {
+                async.parallel({
+
+                    jobExpiryKey: function(next) {
+                        next(null, this._getJobExpiryKey(jobUUID));
+                    }.bind(this),
+
+                    jobDataKey: function(next) {
+                        next(null, this._getJobDataKey(jobUUID));
+                    }.bind(this),
+
+                    nextRunTime: function(next) {
+                        this._computeNextRunTime(jobDefinition, next);
+                    }.bind(this)
+
+                }, function finish(error, results) {
+                    if (error) {
+                        this.emit('schedule error', error);
+                    } else {
+
+                        var now = new Date();
+                        var delay = results.nextRunTime.getTime() - now.getTime();
+
+                        async
+                        .waterfall([
+
+                            function saveJobData(next) {
+                                //save job data
+                                this._saveJobData(results.jobDataKey, jobDefinition, next);
+                            }.bind(this),
+
+                            function setJobKeyExpiry(jobData, next) {
+                                //save key an wait for it to expiry
+                                this._scheduler.set(results.jobExpiryKey, '', 'PX', delay, next);
+                            }.bind(this)
+
+                        ], function(error) {
+                            if (error) {
+                                this.emit('schedule error', error);
+                            }
+                        }.bind(this));
+                    }
+
+                }.bind(this));
+            }
+        }.bind(this));
+
+    }
+
 };
 
 
@@ -496,124 +632,181 @@ Queue.prototype.every = function(interval, job) {
  *
  *              If an error occur, it will be emitted using `schedule error` key
  *              with error passed as first parameter on event.
+ *              
  *              If job schedule successfully, it will be emitted using
  *              `schedule success` key with job instance passed as a first parameter
  *              on event.
  *
  * @param  {Date|String}   when      when should this job run
  * @param  {Job}   jobDefinition valid kue job instance which has not been saved
+ * @example
+ *     1. create non-unique job
+ *     var job = Queue
+ *            .createJob('schedule', data)
+ *            .attempts(3)
+ *            .priority('normal');
+ *            
+ *      Queue.schedule('2 seconds from now', job);
+ *
+ *      2. create unique job
+ *      var job = Queue
+ *              .create('schedule', data)
+ *              .attempts(3)
+ *              .priority('normal')
+ *              .unique(<unique_key>);
+ *              
+ *      Queue.schedule('2 seconds from now', job);
  * @private
  */
 Queue.prototype.schedule = function(when, job) {
     //this refer to kue Queue instance context
-    var self = this;
 
-    if (arguments.length !== 2) {
-        self.emit(
+    //back-off if no interval and job
+    if (!when || !job) {
+        this.emit(
             'schedule error',
-            new Error('Invalid number of parameters. See API doc.')
+            new Error('Invalid number of parameters')
         );
     }
 
-    var jobDefinition = _.extend(job.toJSON(), {
-        backoff: job._backoff
-    });
+    //check for job instance
+    else if (!(job instanceof Job)) {
+        this.emit(
+            'schedule error',
+            new Error('Invalid job type')
+        );
+    }
 
-    async
-    .waterfall(
-        [
-            function computeDelay(next) {
-                //when is date instance
-                if (when instanceof Date) {
-                    next(null, when);
-                }
+    //continue with processing job
+    else {
 
-                //otherwise parse as date.js string
-                else {
-                    self._parse(when, next);
-                }
-            },
-            //set job delay
-            function setDelay(scheduledDate, next) {
-                next(
-                    null,
-                    _.merge(jobDefinition, {
-                        delay: scheduledDate,
-                        data: {
-                            schedule: 'ONCE'
-                        }
-                    })
-                );
-            },
-            function buildJob(delayedJobDefinition, next) {
-                self._buildJob(delayedJobDefinition, next);
-            },
-            function saveJob(job, validations, next) {
-                job.save(function(error) {
-                    if (error) {
-                        next(error);
-                    } else {
-                        next(null, job);
-                    }
-                });
-            }
-        ],
-        function finish(error, job) {
-            if (error) {
-                self.emit('schedule error', error);
-            } else {
-                self.emit('schedule success', job);
-            }
+        var jobDefinition = _.extend(job.toJSON(), {
+            backoff: job._backoff
         });
+
+        async.waterfall(
+            [
+                function computeDelay(next) {
+                    //when is date instance
+                    if (when instanceof Date) {
+                        next(null, when);
+                    }
+
+                    //otherwise parse as date.js string
+                    else {
+                        this._parse(when, next);
+                    }
+                }.bind(this),
+
+                //set job delay
+                function setDelay(scheduledDate, next) {
+                    next(
+                        null,
+                        _.merge(jobDefinition, {
+                            delay: scheduledDate,
+                            data: {
+                                schedule: 'ONCE'
+                            }
+                        })
+                    );
+                },
+
+                function buildJob(delayedJobDefinition, next) {
+                    this._buildJob(delayedJobDefinition, next);
+                }.bind(this),
+
+                function saveJob(job, validations, next) {
+                    job.save(function(error, existJob) {
+                        if (error) {
+                            next(error);
+                        } else {
+                            next(null, existJob || job);
+                        }
+                    });
+                }
+            ],
+            function finish(error, job) {
+                if (error) {
+                    this.emit('schedule error', error);
+                } else if (job.alreadyExist) {
+                    this.emit('already scheduled', job);
+                } else {
+                    this.emit('schedule success', job);
+                }
+            }.bind(this));
+    }
 };
 
 
 /**
  * @function
  * @description schedule a job to be executed immediatelly after being saved.
+ * 
  *              If an error occur, it will be emitted using `schedule error` key
  *              with error passed as first parameter on event.
+ *              
  *              If job schedule successfully, it will be emitted using
  *              `schedule success` key with job instance passed as a first parameter
  *              on event.
+ *              
  * @param  {Job}   job a valid kue job instance which has not been saved
+ * @example
+ *     1. create non-unique job
+ *     var job = Queue
+ *            .createJob('now', data)
+ *            .attempts(3)
+ *            .priority('normal');
+ *            
+ *      Queue.now(job);
+ *
+ *      2. create unique job
+ *      var job = Queue
+ *              .create('now', data)
+ *              .attempts(3)
+ *              .priority('normal')
+ *              .unique(<unique_key>);
+ *              
+ *      Queue.now(job);
  * @private
  */
 Queue.prototype.now = function(job) {
     //this refer to kue Queue instance context
-    var self = this;
 
-    if (arguments.length === 0 && !(job instanceof Job)) {
-        self.emit('schedule error', new Error('Invalid job. See API doc.'));
-    }
+    if (!job || !(job instanceof Job)) {
+        this.emit('schedule error', new Error('Invalid job type'));
+    } else {
 
-    var jobDefinition = _.extend(job.toJSON(), {
-        backoff: job._backoff
-    });
-
-    async
-    .waterfall(
-        [
-            function buildJob(next) {
-                self._buildJob(jobDefinition, next);
-            },
-            function saveJob(job, validations, next) {
-                job.save(function(error) {
-                    if (error) {
-                        next(error);
-                    } else {
-                        next(null, job);
-                    }
-                });
-            }
-        ],
-        function finish(error, job) {
-            if (error) {
-                self.emit('schedule error', error);
-            } else {
-                self.emit('schedule success', job);
-            }
+        var jobDefinition = _.extend(job.toJSON(), {
+            backoff: job._backoff
         });
+
+        async.waterfall(
+            [
+                function buildJob(next) {
+                    this._buildJob(jobDefinition, next);
+                }.bind(this),
+
+                function saveJob(job, validations, next) {
+                    job.save(function(error, existJob) {
+                        if (error) {
+                            next(error);
+                        } else {
+                            next(null, existJob || job);
+                        }
+                    });
+                }
+            ],
+            function finish(error, job) {
+                //TODO fire already scheduled events
+                if (error) {
+                    this.emit('schedule error', error);
+                } else if (job.alreadyExist) {
+                    this.emit('already scheduled', job);
+                } else {
+                    this.emit('schedule success', job);
+                }
+            }.bind(this));
+    }
 };
 
 
